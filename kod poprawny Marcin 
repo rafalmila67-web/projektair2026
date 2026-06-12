@@ -1,0 +1,1297 @@
+#include <SFML/Graphics.hpp>
+#include <vector>
+#include <cmath>
+#include <random>
+#include <sstream>
+#include <iomanip>
+#include <algorithm>
+#include <functional>
+#include <string>
+#include <deque>
+#include <cstdint>
+
+constexpr unsigned int WIN_W  = 1600;
+constexpr unsigned int WIN_H  = 900;
+constexpr float        TILE   = 40.f;
+
+std::mt19937 rng{ std::random_device{}() };
+int   randInt  (int   a, int   b){ return std::uniform_int_distribution<int>  (a,b)(rng); }
+float randFloat(float a, float b){ return std::uniform_real_distribution<float>(a,b)(rng); }
+
+float dist(sf::Vector2f a, sf::Vector2f b){
+    return std::hypot(b.x-a.x, b.y-a.y);
+}
+sf::Vector2f normalize(sf::Vector2f v){
+    float len = std::hypot(v.x, v.y);
+    return len>0.f ? sf::Vector2f(v.x/len, v.y/len) : sf::Vector2f{};
+}
+sf::Vector2f lerp(sf::Vector2f a, sf::Vector2f b, float t){
+    return { a.x + (b.x-a.x)*t, a.y + (b.y-a.y)*t };
+}
+
+sf::RectangleShape makeRect(sf::Vector2f pos, sf::Vector2f size, sf::Color fill, float outline=0, sf::Color outCol=sf::Color::White){
+    sf::RectangleShape r(size); r.setPosition(pos); r.setFillColor(fill);
+    if(outline>0){ r.setOutlineThickness(outline); r.setOutlineColor(outCol); }
+    return r;
+}
+
+sf::Font* loadFont(){
+    static sf::Font f; static bool loaded=false;
+    if(loaded) return &f;
+    const char* paths[]={"/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", "C:/Windows/Fonts/arial.ttf", nullptr};
+    for(int i=0;paths[i];i++) if(f.openFromFile(paths[i])){ loaded=true; return &f; }
+    return nullptr;
+}
+
+void drawText(sf::RenderWindow& w, const std::string& s, sf::Vector2f p, unsigned int sz=18, sf::Color c=sf::Color::White, bool center=false){
+    sf::Font* f = loadFont(); if(!f) return;
+    sf::Text t(*f, s, sz); t.setFillColor(c);
+    if(center){ auto b = t.getLocalBounds(); t.setOrigin({b.position.x+b.size.x/2, b.position.y+b.size.y/2}); }
+    t.setPosition(p); w.draw(t);
+}
+
+const std::vector<sf::Vector2f> PATH_WP = {
+    {  -30, 200}, { 200, 200}, { 200, 400}, { 520, 400},
+    { 520, 160}, { 840, 160}, { 840, 480}, {1120, 480},
+    {1120, 240}, {1400, 240}, {1400, 680}, { 920, 680},
+    { 920, 820}, { 440, 820}, { 440, 580}, { 120, 580},
+    { 120, 820}, {-30,  820}
+};
+
+float pathLength(){
+    static float cached = -1.f;
+    if(cached>0.f) return cached;
+    cached=0.f;
+    for(size_t i=1;i<PATH_WP.size();i++) cached+=dist(PATH_WP[i-1],PATH_WP[i]);
+    return cached;
+}
+
+sf::Vector2f posOnPath(float d){
+    float rem = d;
+    for(size_t i=1;i<PATH_WP.size();i++){
+        float seg = dist(PATH_WP[i-1],PATH_WP[i]);
+        if(rem<=seg){ float t = rem/seg; return lerp(PATH_WP[i-1],PATH_WP[i],t); }
+        rem -= seg;
+    }
+    return PATH_WP.back();
+}
+
+sf::Vector2f getClosestPathPoint(sf::Vector2f p) {
+    sf::Vector2f bestP = p; float bestD = 1e9f;
+    for(size_t i=1; i<PATH_WP.size(); i++){
+        sf::Vector2f a = PATH_WP[i-1], b = PATH_WP[i];
+        sf::Vector2f ab = b - a, ap = p - a;
+        float t = (ab.x*ap.x + ab.y*ap.y)/(ab.x*ab.x + ab.y*ab.y + 0.001f);
+        t = std::clamp(t, 0.f, 1.f);
+        sf::Vector2f proj = a + ab * t;
+        float d = dist(p, proj);
+        if(d < bestD) { bestD = d; bestP = proj; }
+    }
+    return bestP;
+}
+
+struct Particle { sf::Vector2f pos, vel; sf::Color color; float life, maxLife, size; };
+std::vector<Particle> particles;
+
+struct Lightning { sf::Vector2f a, b; float life; };
+std::vector<Lightning> lightnings;
+
+void spawnParticles(sf::Vector2f p, sf::Color c, int n=12, float speed=80.f, float sizeMult=1.f){
+    for(int i=0;i<n;i++){
+        float angle = randFloat(0.f, 6.2832f);
+        float spd   = randFloat(speed*0.4f, speed);
+        particles.push_back({
+            p, {std::cos(angle)*spd, std::sin(angle)*spd}, c,
+            randFloat(0.4f,0.9f), randFloat(0.4f,0.9f), randFloat(3.f,7.f) * sizeMult
+        });
+    }
+}
+
+void updateParticles(float dt){
+    for(auto& p : particles){ p.pos += p.vel*dt; p.vel *= 0.9f; p.life -= dt; }
+    particles.erase(std::remove_if(particles.begin(),particles.end(), [](const Particle& p){ return p.life<=0; }), particles.end());
+    
+    for(auto& l : lightnings) l.life -= dt;
+    lightnings.erase(std::remove_if(lightnings.begin(),lightnings.end(), [](const Lightning& l){ return l.life<=0; }), lightnings.end());
+}
+
+void drawParticles(sf::RenderWindow& w){
+    sf::CircleShape cs;
+    for(auto& p : particles){
+        float a = p.life/p.maxLife;
+        sf::Color c = p.color; c.a = static_cast<std::uint8_t>(255*a);
+        cs.setRadius(p.size*a); cs.setOrigin({p.size*a,p.size*a});
+        cs.setPosition(p.pos); cs.setFillColor(c); w.draw(cs);
+    }
+    for(auto& l : lightnings){
+        float a = l.life / 0.2f;
+        sf::VertexArray line(sf::PrimitiveType::Lines, 2);
+        line[0].position = l.a; line[0].color = {100,200,255,static_cast<std::uint8_t>(255*a)};
+        line[1].position = l.b; line[1].color = {200,255,255,static_cast<std::uint8_t>(255*a)};
+        w.draw(line);
+        line[0].color.a /= 3; line[1].color.a /= 3;
+        sf::Vector2f dir = normalize(l.b - l.a); sf::Vector2f perp = {-dir.y, dir.x};
+        line[0].position = l.a + perp*2.f; line[1].position = l.b + perp*2.f; w.draw(line);
+        line[0].position = l.a - perp*2.f; line[1].position = l.b - perp*2.f; w.draw(line);
+    }
+}
+
+struct Bullet {
+    sf::Vector2f pos, vel;
+    int   targetId, damage;
+    float radius;
+    sf::Color color;
+    float life = 3.f;
+    bool  explosive;
+    float splashRadius;
+    int   level = 1; 
+
+    bool  instakill = false; 
+    int   pierce = 0;
+    std::vector<int> hitTargets; 
+    bool  stun = false;
+};
+std::vector<Bullet> bullets;
+
+enum class EnemyKind { NORMAL, ARMORED, FAST, BOSS, MEDIC, SLIME, SLIME_SMALL };
+
+struct Enemy {
+    int        id;
+    EnemyKind  kind;
+    float      pathDist, speed;
+    int        health, maxHealth, reward, damage, armor = 0;
+    sf::Color  color;
+    float      radius;
+    bool       alive = true;
+    float      flashTimer = 0.f;
+    float      healTimer = 0.f;
+    float      stunTimer = 0.f; 
+    float      bossFreezeTimer = 4.0f; 
+    float      attackCooldown = 0.f;
+
+    sf::Vector2f pos() const { return posOnPath(pathDist); }
+    bool reachedEnd() const { return pathDist >= pathLength(); }
+
+    static Enemy make(EnemyKind k, int wave, int serial, float diffMult){
+        Enemy e; e.id = wave*1000+serial; e.kind = k; e.pathDist = -randFloat(0.f,60.f);
+        float waveScale = 1.f + wave*0.15f; float finalScale = waveScale * diffMult; 
+
+        switch(k){
+        case EnemyKind::NORMAL:
+            e.speed=110.f; e.health=e.maxHealth=int(80*finalScale); e.reward=20; e.damage=5; e.color={220,60,60}; e.radius=12.f; break;
+        case EnemyKind::ARMORED:
+            e.speed=65.f;  e.health=e.maxHealth=int(220*finalScale); e.reward=50; e.damage=12; e.color={160,160,40}; e.radius=16.f; e.armor=15; break;
+        case EnemyKind::FAST:
+            e.speed=210.f; e.health=e.maxHealth=int(45*finalScale); e.reward=30; e.damage=3; e.color={60,200,220}; e.radius=9.f; break;
+        case EnemyKind::BOSS:
+            e.speed=45.f;  e.health=e.maxHealth=int(1200*finalScale); e.reward=200; e.damage=35; e.color={180,20,180}; e.radius=24.f; e.armor=30; break;
+        case EnemyKind::MEDIC:
+            e.speed=70.f;  e.health=e.maxHealth=int(180*finalScale); e.reward=60; e.damage=8; e.color={80,255,120}; e.radius=14.f; e.armor=5; break;
+        case EnemyKind::SLIME:
+            e.speed=50.f;  e.health=e.maxHealth=int(260*finalScale); e.reward=40; e.damage=10; e.color={50,180,50}; e.radius=18.f; break;
+        case EnemyKind::SLIME_SMALL:
+            e.speed=230.f; e.health=e.maxHealth=int(25*finalScale); e.reward=10; e.damage=2; e.color={120,255,120}; e.radius=7.f; break;
+        }
+        return e;
+    }
+
+    void takeDamage(int dmg){
+        dmg = std::max(1, dmg - armor);
+        health -= dmg; flashTimer = 0.12f;
+        if(health<=0){ health=0; alive=false; }
+    }
+
+    void updateTimers(float dt){
+        if(flashTimer>0.f) flashTimer-=dt;
+        if(stunTimer>0.f) stunTimer-=dt;
+    }
+
+    void draw(sf::RenderWindow& w) const {
+        if(!alive) return;
+        sf::Vector2f p = pos();
+        sf::CircleShape shadow(radius*1.1f); shadow.setOrigin({radius*1.1f,radius*1.1f});
+        shadow.setPosition({p.x+3,p.y+3}); shadow.setFillColor({0,0,0,60}); w.draw(shadow);
+
+        sf::CircleShape body(radius); body.setOrigin({radius,radius}); body.setPosition(p);
+        
+        sf::Color finalColor = flashTimer>0.f ? sf::Color::White : color;
+        if (stunTimer > 0.f) finalColor = {200, 200, 100}; 
+        body.setFillColor(finalColor);
+
+        if(kind==EnemyKind::ARMORED || kind==EnemyKind::BOSS){ body.setOutlineThickness(3.f); body.setOutlineColor(kind==EnemyKind::BOSS?sf::Color(255,150,255):sf::Color::Yellow); }
+        else if(kind==EnemyKind::MEDIC) { body.setOutlineThickness(2.f); body.setOutlineColor({255,255,255}); }
+        w.draw(body);
+
+        float pct = float(health)/float(maxHealth); float bw = radius*2.5f;
+        sf::RectangleShape hbg({bw,6.f}), hfg({bw*pct,6.f});
+        hbg.setFillColor({60,0,0}); hbg.setPosition({p.x-bw/2,p.y-radius-10});
+        hfg.setFillColor(pct>0.5f?sf::Color::Green:pct>0.2f?sf::Color::Yellow:sf::Color::Red);
+        hfg.setPosition({p.x-bw/2,p.y-radius-10});
+        w.draw(hbg); w.draw(hfg);
+    }
+};
+
+enum class TowerKind { BASIC, SNIPER, ARTILLERY, FROST, LASER, MINE, TESLA, BARRACKS };
+enum class Mutation  { NONE, PATH_A, PATH_B };
+
+struct TowerDef {
+    const char* name; const char* desc;
+    int cost, upgradeCost;
+    float range, fireRate, projSpeed; int damage;
+    sf::Color color, projColor;
+    bool explosive; float splashR; bool slows;
+};
+
+const TowerDef TOWER_DEFS[] = {
+    {"Strażnik",   "Szybki, śred. zasięg",     100, 80,  160, 0.7f, 350, 30,  {70,110,210}, {200,230,255}, false, 0,  false},
+    {"Snajper",    "Duży zasięg, duże dmg",    220, 120, 340, 2.2f, 700, 100, {50,180,120}, {150,255,180}, false, 0,  false},
+    {"Artyleria",  "Odłamki, wolna",           380, 160, 230, 3.5f, 200, 140, {200,120,40}, {255,200,80},  true,  80, false},
+    {"Mroźnik",    "Spowalnia wrogów",         180, 100, 180, 1.2f, 220, 20,  {80,180,240}, {160,220,255}, false, 0,  true},
+    {"Laser",      "Ciągły ogień",             300, 140, 200, 0.15f,900, 18,  {200,50,200}, {255,100,255}, false, 0,  false},
+    {"Kopalnia",   "Generuje kasę (bez atak)", 150, 120, 0,   4.0f, 0,   0,   {255,215,0},  {0,0,0},       false, 0,  false},
+    {"Tesla",      "Skaczące błyskawice",      250, 150, 180, 1.8f, 0,   60,  {100,200,255},{200,255,255}, false, 0,  false},
+    {"Koszary",    "Wojownicy blokują wrogów", 180, 110, 150, 1.2f, 0,   15,  {200,100,50}, {0,0,0},       false, 0,  false},
+};
+
+std::pair<std::string, std::string> getMutationInfo(TowerKind kind) {
+    switch(kind) {
+        case TowerKind::BASIC: return {"[A] Szybkostrzelny\n2x wyższa szybkostrzelność", "[B] Niszczyciel\n2.5x więcej obrażeń"};
+        case TowerKind::SNIPER: return {"[A] Zabójca (Zasięg -30%)\n10% szans na natychmiastowe\nzabicie (nie bossów)", "[B] Penetrator\nPocisk przebija do 3 wrogów\nw jednej linii"};
+        case TowerKind::ARTILLERY: return {"[A] Napalm\n+50% większe pole rażenia", "[B] Ogłuszenie\nEksplozje zatrzymują\nwrogów na 1 sekundę"};
+        case TowerKind::FROST: return {"[A] Zamieć\nDużo większy zasięg wieży", "[B] Zamarznięcie\nPociski całkowicie zatrzymują\nwroga na 0.5s"};
+        case TowerKind::LASER: return {"[A] Przegrzanie\n+50% Obrażeń Lasera", "[B] Długi Promień\nOgromny zasięg lasera"};
+        case TowerKind::MINE: return {"[A] Bogactwo\nGeneruje 30$ zamiast 15$", "[B] Gorączka Złota\nGeneruje złoto 2x szybciej"};
+        case TowerKind::TESLA: return {"[A] Przeciążenie\nBłyskawica przeskakuje\nna +2 dodatkowe cele", "[B] Wysokie Napięcie\nBłyskawica ogłusza wrogów\nna 0.5 sekundy"};
+        case TowerKind::BARRACKS: return {"[A] Paladyni\nWojownicy mają +50% HP\ni znacznie szybciej wracają", "[B] Berserkerzy\nWojownicy zadają w walce\n3x więcej obrażeń"};
+    }
+    return {"",""};
+}
+
+struct Warrior {
+    sf::Vector2f pos, rallyPoint;
+    int hp = 60, maxHp = 60;
+    float attackCooldown = 0.f;
+    float respawnTimer = 0.f;
+    bool alive = true;
+};
+
+struct Tower {
+    int          id;
+    TowerKind    kind;
+    sf::Vector2f pos;
+    int          level = 1;
+    Mutation     mutation = Mutation::NONE;
+    float        cooldown = 0.f;
+    bool         selected = false;
+    bool         firing = false;
+    int          targetId = -1;
+    float        aimAngle = 0.f;
+    int          currentBarrel = 0;
+    
+    float        recoil = 0.f; 
+
+    bool         frozen = false;
+    int          unfreezeClicks = 0;
+    
+    sf::Vector2f rallyPoint;
+    std::vector<Warrior> warriors;
+
+    const TowerDef& def() const { return TOWER_DEFS[int(kind)]; }
+    
+    float range() const { 
+        float r = def().range * (1.f + (level-1)*0.15f); 
+        if (mutation == Mutation::PATH_A && kind == TowerKind::SNIPER) r *= 0.7f;
+        if (mutation == Mutation::PATH_A && kind == TowerKind::FROST)  r *= 1.5f;
+        if (mutation == Mutation::PATH_B && kind == TowerKind::LASER)  r *= 1.6f;
+        return r;
+    }
+    
+    float fireRate() const { 
+        float fr = def().fireRate;
+        if (kind == TowerKind::BASIC) fr /= level;
+        else fr *= (1.f - (level-1)*0.15f); 
+        
+        if (mutation == Mutation::PATH_A && kind == TowerKind::BASIC) fr *= 0.5f; 
+        if (mutation == Mutation::PATH_B && kind == TowerKind::MINE)  fr *= 0.5f; 
+        return fr;
+    }
+    
+    int damage() const { 
+        int dmg = def().damage;
+        if (kind == TowerKind::SNIPER) dmg = int(dmg * std::pow(1.8f, level-1));
+        else dmg = int(dmg * (1.f + (level-1)*0.3f)); 
+        
+        if (mutation == Mutation::PATH_B && kind == TowerKind::BASIC) dmg = int(dmg * 2.5f);
+        if (mutation == Mutation::PATH_A && kind == TowerKind::LASER) dmg = int(dmg * 1.5f);
+        return dmg;
+    }
+
+    void draw(sf::RenderWindow& w, bool buildMode, bool isDragged) const {
+        if((selected || buildMode) && kind != TowerKind::MINE){
+            sf::CircleShape rc(range());
+            rc.setOrigin({range(),range()}); rc.setPosition(pos);
+            rc.setFillColor({255,255,255,10}); rc.setOutlineColor({255,255,255,60}); rc.setOutlineThickness(1.f);
+            w.draw(rc);
+        }
+
+        sf::RectangleShape base({42,42}); base.setOrigin({21,21}); base.setPosition(pos);
+        base.setFillColor(isDragged ? sf::Color(50,50,70,200) : sf::Color(30,30,50));
+        
+        sf::Color outCol = (isDragged ? sf::Color(120,120,255) : sf::Color(80,80,100));
+        if (mutation == Mutation::PATH_A) outCol = sf::Color(255, 100, 100);
+        if (mutation == Mutation::PATH_B) outCol = sf::Color(100, 255, 100);
+        base.setOutlineColor(outCol); base.setOutlineThickness(2.f); w.draw(base);
+
+        sf::Vector2f rOffset = { -std::cos(aimAngle * 3.14159f / 180.f) * recoil, -std::sin(aimAngle * 3.14159f / 180.f) * recoil };
+        sf::Vector2f bPos = pos + rOffset;
+
+        if (kind == TowerKind::MINE) {
+            sf::CircleShape coin(12.f); coin.setOrigin({12,12}); coin.setPosition(pos);
+            coin.setFillColor({255,215,0}); coin.setOutlineColor({200,150,0}); coin.setOutlineThickness(2.f);
+            float pulse = 1.f + 0.1f * std::sin(cooldown * 5.f);
+            if(frozen) pulse = 1.f; 
+            coin.setScale({pulse, pulse}); w.draw(coin);
+        } 
+        else if (kind == TowerKind::BARRACKS) {
+            sf::RectangleShape roof({30, 30}); roof.setOrigin({15, 15}); roof.setPosition(pos);
+            roof.setFillColor(def().color); roof.setRotation(sf::degrees(45.f)); w.draw(roof);
+
+            if (selected) {
+                sf::CircleShape flag(4.f); flag.setOrigin({4.f, 4.f}); flag.setPosition(rallyPoint);
+                flag.setFillColor(sf::Color::Blue); w.draw(flag);
+            }
+
+            for(const auto& warr : warriors) {
+                if (!warr.alive) continue;
+                sf::CircleShape c(5.f); c.setOrigin({5.f, 5.f}); c.setPosition(warr.pos);
+                c.setFillColor(mutation == Mutation::PATH_A ? sf::Color(255, 215, 0) : sf::Color(200, 100, 50));
+                c.setOutlineThickness(1.f); c.setOutlineColor(sf::Color::White); w.draw(c);
+                
+                float pct = std::max(0.f, (float)warr.hp / warr.maxHp);
+                sf::RectangleShape wbg({10.f, 2.f}); wbg.setPosition({warr.pos.x - 5.f, warr.pos.y - 8.f}); wbg.setFillColor(sf::Color::Red);
+                sf::RectangleShape wfg({10.f * pct, 2.f}); wfg.setPosition({warr.pos.x - 5.f, warr.pos.y - 8.f}); wfg.setFillColor(sf::Color::Green);
+                w.draw(wbg); w.draw(wfg);
+            }
+        }
+        else if (kind == TowerKind::TESLA) {
+            sf::CircleShape dome(12.f + level*2.f); dome.setOrigin({12.f + level*2.f, 12.f + level*2.f});
+            dome.setPosition(pos); dome.setFillColor(def().color);
+            dome.setOutlineThickness(2.f); dome.setOutlineColor({255,255,255, 150});
+            w.draw(dome);
+            sf::RectangleShape ant({4, 16}); ant.setOrigin({2, 16}); ant.setPosition(pos);
+            ant.setFillColor({200,255,255}); w.draw(ant);
+        }
+        else if (kind == TowerKind::BASIC) {
+            for(int i = 0; i < level; i++) {
+                sf::RectangleShape barrel({28, 6}); barrel.setOrigin({4, 3});
+                float offset = 0.f;
+                if (level == 2) offset = (i == 0) ? -5.f : 5.f;
+                if (level == 3) offset = (i == 0) ? -7.f : (i == 1 ? 0.f : 7.f);
+
+                sf::Vector2f bPosOff = bPos;
+                float perpAngle = aimAngle + 90.f;
+                bPosOff.x += std::cos(perpAngle * 3.14159f / 180.f) * offset;
+                bPosOff.y += std::sin(perpAngle * 3.14159f / 180.f) * offset;
+
+                barrel.setPosition(bPosOff); barrel.setFillColor(def().color);
+                barrel.setRotation(sf::degrees(aimAngle)); w.draw(barrel);
+            }
+        } 
+        else if (kind == TowerKind::SNIPER) {
+            float bLen = 28.f + (level-1)*16.f; float bThick = 8.f + (level-1)*4.f;
+            sf::RectangleShape barrel({bLen, bThick}); barrel.setOrigin({4, bThick/2.f});
+            barrel.setPosition(bPos); barrel.setFillColor(def().color);
+            barrel.setRotation(sf::degrees(aimAngle)); w.draw(barrel);
+        } 
+        else if (kind == TowerKind::ARTILLERY) {
+            float bThick = 14.f + (level-1)*10.f;
+            sf::RectangleShape barrel({28, bThick}); barrel.setOrigin({4, bThick/2.f});
+            barrel.setPosition(bPos); barrel.setFillColor(def().color);
+            barrel.setRotation(sf::degrees(aimAngle)); w.draw(barrel);
+        } 
+        else if (kind == TowerKind::FROST) {
+            for(int i = 0; i < level; i++) {
+                sf::RectangleShape barrel({26.f + i*3.f, 4.f}); barrel.setOrigin({-4.f - i*2.f, 2.f}); 
+                barrel.setPosition(bPos); barrel.setFillColor(sf::Color(180, 240, 255, 200));
+                barrel.setRotation(sf::degrees(aimAngle + (i - (level-1)/2.f)*20.f)); w.draw(barrel);
+            }
+        } 
+        else {
+            sf::RectangleShape barrel({28, 8}); barrel.setOrigin({4, 4});
+            barrel.setPosition(bPos); barrel.setFillColor(def().color);
+            barrel.setRotation(sf::degrees(aimAngle)); w.draw(barrel);
+        }
+
+        if (kind != TowerKind::MINE && kind != TowerKind::TESLA && kind != TowerKind::BARRACKS) {
+            sf::CircleShape head(10.f); head.setOrigin({10,10}); head.setPosition(pos);
+            head.setFillColor(def().color); head.setOutlineColor({255,255,255,120});
+            head.setOutlineThickness(2.f); w.draw(head);
+        }
+
+        if(level>1){
+            int stars = level - 1; float startX = pos.x - (stars - 1) * 4.5f;
+            for(int i=0; i<stars; i++){
+                sf::CircleShape star(3.5f); star.setOrigin({3.5f, 3.5f});
+                star.setPosition({startX + i*9.f, pos.y+18});
+                sf::Color sCol = sf::Color::Yellow;
+                if(i == 1) {
+                    if(mutation == Mutation::PATH_A) sCol = sf::Color(255, 100, 100);
+                    if(mutation == Mutation::PATH_B) sCol = sf::Color(100, 255, 100);
+                }
+                star.setFillColor(sCol); w.draw(star);
+            }
+        }
+
+        if (frozen) {
+            sf::RectangleShape ice({46.f, 46.f}); ice.setOrigin({23.f, 23.f});
+            ice.setPosition(pos); ice.setFillColor({160, 220, 255, 180});
+            ice.setOutlineThickness(2.f); ice.setOutlineColor({200, 240, 255, 220}); w.draw(ice);
+            drawText(w, std::to_string(unfreezeClicks), {pos.x, pos.y - 8}, 22, sf::Color::Red, true);
+        }
+    }
+};
+
+struct FloatText { sf::Vector2f pos; std::string txt; sf::Color col; float life; };
+std::vector<FloatText> floatTexts;
+void addFloat(sf::Vector2f p, const std::string& t, sf::Color c={255,255,100}, float l=1.2f){ floatTexts.push_back({p,t,c,l}); }
+
+enum class Phase { MENU, BUILD, COMBAT, GAME_OVER, WIN, MUTATION_SELECT };
+enum class Difficulty { EASY, NORMAL, HARD };
+
+struct Wave { int normal, armored, fast, boss, medic, slime; };
+const Wave WAVES[] = {
+    {8,0,0,0,0,0}, {10,2,0,0,0,0}, {12,2,4,0,1,0}, {10,4,4,0,2,2}, {12,4,6,1,2,3},
+    {14,6,6,1,3,4},{16,8,8,2,4,4},{20,10,10,2,5,5},{25,12,12,3,6,6},{30,15,15,4,8,8}
+};
+constexpr int TOTAL_WAVES = 10;
+
+struct Game {
+    Phase   phase     = Phase::MENU; 
+    Phase   prevPhase = Phase::MENU; 
+    Difficulty difficulty = Difficulty::NORMAL;
+    float   diffMult  = 1.0f; 
+    
+    int     wave      = 0, money = 600, lives = 20, score = 0, kills = 0;
+    float   buildTime = 0.f, spawnTimer= 0.f;
+    int     toSpawn   = 0, spawnSerial = 0;
+    
+    float   damageFlashTimer = 0.f; 
+    float   screenShake = 0.f; 
+
+    float   spellMeteorCD = 0.f;
+    float   spellFreezeCD = 0.f;
+    bool    targetingMeteor = false;
+
+    TowerKind    selectedKind = TowerKind::BASIC;
+    sf::Vector2f mouseWorld   = {};
+
+    static constexpr int MAX_LEVEL = 3;
+    int draggedTowerId = -1;
+    sf::Vector2f dragStartPos = {0.f, 0.f};
+
+    int mutSourceTowerId = -1;
+    int mutTargetTowerId = -1;
+
+    std::vector<Enemy>  enemies;
+    std::vector<Tower>  towers;
+    int nextTowerId = 1;
+
+    void startGame(Difficulty d) {
+        difficulty = d; phase = Phase::BUILD; wave = 0; score = 0; kills = 0;
+        enemies.clear(); towers.clear(); bullets.clear(); particles.clear(); floatTexts.clear(); lightnings.clear();
+        damageFlashTimer = 0.f; screenShake = 0.f; spellMeteorCD = 0.f; spellFreezeCD = 0.f; targetingMeteor = false;
+        
+        if (d == Difficulty::EASY) { money = 800; lives = 30; diffMult = 0.75f; }
+        else if (d == Difficulty::NORMAL) { money = 600; lives = 20; diffMult = 1.0f; }
+        else if (d == Difficulty::HARD) { money = 400; lives = 10; diffMult = 1.35f; }
+    }
+
+    int buyCost() const { return TOWER_DEFS[int(selectedKind)].cost; }
+    bool canAfford() const { return money >= buyCost(); }
+
+    bool onPath(sf::Vector2f p) const {
+        for(size_t i=1;i<PATH_WP.size();i++){
+            sf::Vector2f a=PATH_WP[i-1], b=PATH_WP[i]; sf::Vector2f ab=b-a, ap=p-a;
+            float t = (ab.x*ap.x+ab.y*ap.y)/(ab.x*ab.x+ab.y*ab.y+0.001f); t = std::clamp(t,0.f,1.f);
+            if(dist({a.x+ab.x*t, a.y+ab.y*t}, p)<32.f) return true;
+        } return false;
+    }
+    bool towersOverlap(sf::Vector2f p) const { for(auto& t:towers) if(dist(t.pos,p)<38.f) return true; return false; }
+    bool canPlace(sf::Vector2f p) const {
+        if(p.x<5||p.y<90||p.x>WIN_W-5||p.y>WIN_H-5) return false;
+        return !onPath(p) && !towersOverlap(p);
+    }
+
+    void placeTower(sf::Vector2f p){
+        if(!canAfford()||!canPlace(p)) return;
+        Tower t; t.id=nextTowerId++; t.kind=selectedKind; t.pos=p;
+        
+        if (t.kind == TowerKind::BARRACKS) {
+            t.rallyPoint = getClosestPathPoint(p);
+            for(int i=0; i<3; i++) {
+                Warrior w; w.pos = p; w.maxHp = w.hp = 60;
+                float angle = i * 2.094f;
+                w.rallyPoint = t.rallyPoint + sf::Vector2f(std::cos(angle)*12.f, std::sin(angle)*12.f);
+                t.warriors.push_back(w);
+            }
+        }
+        
+        towers.push_back(t); money -= buyCost();
+        spawnParticles(p,TOWER_DEFS[int(selectedKind)].color,8,60.f);
+    }
+
+    void startWave(){
+        if(wave >= TOTAL_WAVES){ phase=Phase::WIN; return; }
+        phase = Phase::COMBAT;
+        const Wave& w = WAVES[wave];
+        toSpawn = w.normal + w.armored + w.fast + w.boss + w.medic + w.slime;
+        spawnTimer = 0.f; spawnSerial = 0;
+    }
+
+    void spawnNext(){
+        const Wave& w = WAVES[wave];
+        int spawned = (w.normal + w.armored + w.fast + w.boss + w.medic + w.slime) - toSpawn;
+        EnemyKind kind;
+        if(spawned < w.normal) kind = EnemyKind::NORMAL;
+        else if(spawned < w.normal+w.armored) kind = EnemyKind::ARMORED;
+        else if(spawned < w.normal+w.armored+w.fast) kind = EnemyKind::FAST;
+        else if(spawned < w.normal+w.armored+w.fast+w.boss) kind = EnemyKind::BOSS;
+        else if(spawned < w.normal+w.armored+w.fast+w.boss+w.medic) kind = EnemyKind::MEDIC;
+        else kind = EnemyKind::SLIME;
+        enemies.push_back(Enemy::make(kind, wave, spawnSerial++, diffMult));
+        toSpawn--;
+    }
+
+    void applyMutation(Mutation mut) {
+        auto targetIt = std::find_if(towers.begin(), towers.end(), [&](const Tower& t){return t.id == mutTargetTowerId;});
+        auto sourceIt = std::find_if(towers.begin(), towers.end(), [&](const Tower& t){return t.id == mutSourceTowerId;});
+        if (targetIt != towers.end() && sourceIt != towers.end()) {
+            targetIt->level = 3; targetIt->mutation = mut;
+            if(targetIt->kind == TowerKind::BARRACKS) {
+                for(auto& w : targetIt->warriors) {
+                    w.maxHp = 60 + (targetIt->level-1)*40;
+                    if(targetIt->mutation == Mutation::PATH_A) w.maxHp = int(w.maxHp * 1.5f);
+                    w.hp = w.maxHp;
+                }
+            }
+            addFloat(targetIt->pos, "MUTACJA! ★★★", {255,100,255}, 1.5f);
+            spawnParticles(targetIt->pos, {255,100,255}, 30, 120.f);
+            towers.erase(sourceIt);
+        }
+        phase = prevPhase;
+    }
+    
+    void castMeteor(sf::Vector2f pos) {
+        spellMeteorCD = 30.f; screenShake += 25.f; targetingMeteor = false;
+        spawnParticles(pos, {255, 100, 50}, 80, 250.f, 2.5f);
+        addFloat({pos.x, pos.y-50}, "BOOM!", {255,50,0}, 2.f);
+        for(auto& e : enemies) {
+            if (e.alive && dist(pos, e.pos()) < 220.f) {
+                e.takeDamage(1500);
+                if (!e.alive) { score+=e.reward; kills++; money+=e.reward; }
+            }
+        }
+    }
+    
+    void castGlobalFreeze() {
+        spellFreezeCD = 40.f; screenShake += 10.f;
+        addFloat({WIN_W/2.f, WIN_H/2.f}, "GLOBALNE ZAMROZENIE!", {160,220,255}, 2.5f);
+        for(auto& e : enemies) { if (e.alive) e.stunTimer += 4.0f; }
+    }
+
+    void update(float dt){
+        if(phase == Phase::MUTATION_SELECT || phase == Phase::MENU) return;
+        buildTime += dt;
+        
+        if (damageFlashTimer > 0.f) damageFlashTimer -= dt;
+        if (screenShake > 0.f) screenShake = std::max(0.f, screenShake - dt * 45.f);
+        if (spellMeteorCD > 0.f) spellMeteorCD -= dt;
+        if (spellFreezeCD > 0.f) spellFreezeCD -= dt;
+
+        for(auto& t : towers) if(t.recoil > 0.f) t.recoil = std::max(0.f, t.recoil - dt * 30.f);
+
+        if(phase == Phase::COMBAT){
+            spawnTimer += dt;
+            float interval = (wave<3)?1.4f:(wave<6)?1.0f:0.7f;
+            if(toSpawn>0 && spawnTimer>=interval){ spawnNext(); spawnTimer=0.f; }
+
+            for(auto& e : enemies) {
+                if (e.alive && e.kind == EnemyKind::MEDIC) {
+                    e.healTimer += dt;
+                    if (e.healTimer >= 1.5f) {
+                        e.healTimer = 0.f; bool healedAny = false;
+                        for (auto& other : enemies) {
+                            if (other.alive && other.health < other.maxHealth && dist(e.pos(), other.pos()) < 120.f) {
+                                other.health = std::min(other.maxHealth, other.health + int(20 * (1.f + wave*0.1f)));
+                                spawnParticles(other.pos(), {100, 255, 100}, 4, 40.f); healedAny = true;
+                            }
+                        }
+                        if (healedAny) addFloat({e.pos().x, e.pos().y-20}, "+Leczenie!", {100,255,100}, 0.8f);
+                    }
+                }
+                if (e.alive && e.kind == EnemyKind::BOSS && e.stunTimer <= 0.f) {
+                    e.bossFreezeTimer -= dt;
+                    if (e.bossFreezeTimer <= 0.f) {
+                        e.bossFreezeTimer = 4.0f; 
+                        std::vector<Tower*> validTowers;
+                        for (auto& t : towers) if (!t.frozen && t.kind != TowerKind::MINE && t.kind != TowerKind::BARRACKS) validTowers.push_back(&t);
+                        if (!validTowers.empty()) {
+                            std::sort(validTowers.begin(), validTowers.end(), [](Tower* a, Tower* b){
+                                if (a->level != b->level) return a->level > b->level;
+                                return a->damage() > b->damage();
+                            });
+                            Tower* target = validTowers[0]; target->frozen = true; target->unfreezeClicks = 3;
+                            addFloat(target->pos, "ZAMROZONA!", {160, 220, 255}, 2.0f);
+                            spawnParticles(target->pos, {160, 220, 255}, 30, 80.f);
+                        }
+                    }
+                }
+            }
+
+            for(auto& e : enemies){
+                if(!e.alive) continue;
+                e.updateTimers(dt);
+                if(e.stunTimer > 0.f) continue;
+
+                bool isBlocked = false;
+                for(auto& t : towers) {
+                    if(t.kind != TowerKind::BARRACKS) continue;
+                    for(auto& w : t.warriors) {
+                        if(!w.alive) continue;
+                        if(dist(e.pos(), w.pos) < e.radius + 8.f) {
+                            isBlocked = true;
+                            
+                            e.attackCooldown -= dt;
+                            if(e.attackCooldown <= 0.f) {
+                                w.hp -= e.damage;
+                                e.attackCooldown = 1.0f;
+                                spawnParticles(w.pos, {255,0,0}, 4, 30.f);
+                            }
+                            
+                            w.attackCooldown -= dt;
+                            if(w.attackCooldown <= 0.f) {
+                                int wDmg = t.damage();
+                                if(t.mutation == Mutation::PATH_B) wDmg *= 3; 
+                                e.takeDamage(wDmg);
+                                w.attackCooldown = t.fireRate();
+                                spawnParticles(e.pos(), {200,200,200}, 4, 30.f);
+                            }
+                            
+                            if(w.hp <= 0) {
+                                w.alive = false;
+                                float respTime = 8.0f - t.level;
+                                if(t.mutation == Mutation::PATH_A) respTime *= 0.5f; 
+                                w.respawnTimer = respTime;
+                                spawnParticles(w.pos, {200,150,50}, 15, 60.f);
+                            }
+                            break; 
+                        }
+                    }
+                    if (isBlocked) break;
+                }
+
+                if (!isBlocked) e.pathDist += e.speed * dt;
+
+                if(e.reachedEnd()){
+                    lives -= 1; 
+                    e.alive = false;
+                    damageFlashTimer = 1.0f; screenShake += 15.f; 
+                    spawnParticles(e.pos(),{255,50,50},30,150.f);
+                }
+            }
+            
+            std::vector<Enemy> newEnemies;
+            for(auto& e : enemies) {
+                if (!e.alive && e.health <= 0 && e.kind == EnemyKind::SLIME) {
+                    for(int i=0; i<3; i++) {
+                        Enemy se = Enemy::make(EnemyKind::SLIME_SMALL, wave, spawnSerial++, diffMult);
+                        se.pathDist = std::max(0.f, e.pathDist - i*15.f); newEnemies.push_back(se);
+                    }
+                }
+            }
+            if(!newEnemies.empty()) enemies.insert(enemies.end(), newEnemies.begin(), newEnemies.end());
+            enemies.erase(std::remove_if(enemies.begin(),enemies.end(), [](const Enemy& e){ return !e.alive; }),enemies.end());
+
+            for(auto& tower : towers){
+                if (tower.frozen) continue; 
+
+                tower.cooldown -= dt; tower.firing = false;
+                
+                if (tower.kind == TowerKind::BARRACKS) {
+                    for(auto& w : tower.warriors) {
+                        if (!w.alive) {
+                            w.respawnTimer -= dt;
+                            if (w.respawnTimer <= 0.f) {
+                                w.alive = true;
+                                w.maxHp = 60 + (tower.level-1)*40;
+                                if(tower.mutation == Mutation::PATH_A) w.maxHp = int(w.maxHp * 1.5f);
+                                w.hp = w.maxHp;
+                                w.pos = tower.pos;
+                            }
+                        } else {
+                            if (dist(w.pos, w.rallyPoint) > 2.f) w.pos += normalize(w.rallyPoint - w.pos) * 60.f * dt;
+                        }
+                    }
+                    continue; 
+                }
+
+                if (tower.kind == TowerKind::MINE) {
+                    if (tower.cooldown <= 0.f) {
+                        tower.cooldown = tower.fireRate();
+                        int inc = (tower.mutation == Mutation::PATH_A) ? 30 : 15; if (tower.level == 2) inc = 20;
+                        money += inc; addFloat(tower.pos, "+"+std::to_string(inc)+"$", {255,215,0});
+                        spawnParticles(tower.pos, {255,215,0}, 6, 30.f);
+                    } continue; 
+                }
+
+                Enemy* target = nullptr; float bestDist = -1e9f;
+                for(auto& e : enemies){
+                    if(e.alive && dist(tower.pos, e.pos()) <= tower.range()){
+                        if(e.pathDist > bestDist){ bestDist=e.pathDist; target=&e; }
+                    }
+                }
+                tower.targetId = target ? target->id : -1;
+
+                if(target){
+                    sf::Vector2f dir = target->pos()-tower.pos;
+                    tower.aimAngle = std::atan2(dir.y,dir.x)*180.f/3.14159f;
+                    if(tower.cooldown<=0.f){
+                        tower.cooldown = tower.fireRate();
+                        tower.recoil = 8.f; 
+                        
+                        if (tower.kind == TowerKind::BASIC) tower.currentBarrel = (tower.currentBarrel + 1) % tower.level;
+
+                        if (tower.kind == TowerKind::TESLA) {
+                            tower.firing = true;
+                            int jumps = 3; if(tower.level==2) jumps=4; if(tower.mutation == Mutation::PATH_A) jumps += 2;
+                            std::vector<int> hitIds; Enemy* currTarget = target;
+                            
+                            for(int j=0; j<jumps; j++){
+                                hitIds.push_back(currTarget->id);
+                                currTarget->takeDamage(tower.damage());
+                                if(tower.mutation == Mutation::PATH_B && currTarget->kind != EnemyKind::BOSS) currTarget->stunTimer = 0.5f;
+                                if(!currTarget->alive){ score+=currTarget->reward; kills++; money+=currTarget->reward; spawnParticles(currTarget->pos(),currTarget->color,10,70.f); }
+                                
+                                Enemy* next = nullptr; float cDist = 180.f;
+                                for(auto& e2 : enemies){
+                                    if(e2.alive && std::find(hitIds.begin(),hitIds.end(),e2.id) == hitIds.end() && dist(currTarget->pos(), e2.pos()) < cDist){
+                                        cDist = dist(currTarget->pos(), e2.pos()); next = &e2;
+                                    }
+                                }
+                                if(j==0) lightnings.push_back({tower.pos, currTarget->pos(), 0.15f});
+                                if(next) { lightnings.push_back({currTarget->pos(), next->pos(), 0.15f}); currTarget = next; }
+                                else break;
+                            }
+                        }
+                        else if(tower.kind==TowerKind::LASER){
+                            tower.firing = true; target->takeDamage(tower.damage());
+                            if(!target->alive){
+                                score+=target->reward; kills++; money+=target->reward;
+                                spawnParticles(target->pos(),target->color,16,90.f); addFloat(target->pos(),"+"+std::to_string(target->reward)+"$",{100,255,100});
+                            } else spawnParticles(target->pos(),{255,150,255},4,50.f);
+                        } else {
+                            Bullet b; sf::Vector2f spawnPos = tower.pos;
+                            if (tower.kind == TowerKind::BASIC) {
+                                float offset = 0.f;
+                                if(tower.level == 2) offset = (tower.currentBarrel == 0) ? -5.f : 5.f;
+                                if(tower.level == 3) offset = (tower.currentBarrel == 0) ? -7.f : (tower.currentBarrel == 1 ? 0.f : 7.f);
+                                float perp = tower.aimAngle * 3.14159f / 180.f + 1.5708f;
+                                spawnPos.x += std::cos(perp) * offset; spawnPos.y += std::sin(perp) * offset;
+                            }
+                            if (tower.kind == TowerKind::ARTILLERY) screenShake += 3.f; 
+
+                            b.pos = spawnPos; b.vel = normalize(target->pos()-tower.pos) * tower.def().projSpeed;
+                            b.targetId = target->id; b.damage = tower.damage(); b.radius = tower.def().explosive ? 7.f : 4.f; 
+                            b.color = tower.def().projColor; b.explosive = tower.def().explosive; b.level = tower.level; 
+                            b.splashRadius = tower.def().splashR * (1.f + (tower.level-1)*0.6f); 
+                            
+                            if (tower.mutation == Mutation::PATH_A && tower.kind == TowerKind::ARTILLERY) b.splashRadius *= 1.5f;
+                            if (tower.mutation == Mutation::PATH_B && tower.kind == TowerKind::ARTILLERY) b.stun = true;
+                            if (tower.mutation == Mutation::PATH_A && tower.kind == TowerKind::SNIPER) b.instakill = true;
+                            if (tower.mutation == Mutation::PATH_B && tower.kind == TowerKind::SNIPER) b.pierce = 3;
+                            if (tower.mutation == Mutation::PATH_B && tower.kind == TowerKind::FROST)  b.stun = true;
+
+                            if(tower.def().slows) b.color = {160,220,255};
+                            bullets.push_back(b);
+                        }
+                    }
+                }
+            }
+
+            for(auto& b : bullets){
+                b.pos += b.vel * dt; b.life -= dt;
+                for(auto& e : enemies){
+                    if(e.alive && dist(b.pos, e.pos()) < b.radius + e.radius){
+                        if (b.pierce > 0) { if (std::find(b.hitTargets.begin(), b.hitTargets.end(), e.id) != b.hitTargets.end()) continue; b.hitTargets.push_back(e.id); }
+
+                        if(b.explosive){
+                            screenShake += 5.f + b.level*3.f; 
+                            for(auto& e2 : enemies){
+                                if(e2.alive && dist(b.pos,e2.pos())<b.splashRadius){
+                                    e2.takeDamage(b.damage);
+                                    if(b.stun && e2.kind != EnemyKind::BOSS) e2.stunTimer = 1.0f;
+                                    if(!e2.alive){ score+=e2.reward; kills++; money+=e2.reward; spawnParticles(e2.pos(),e2.color,16,90.f); addFloat(e2.pos(),"+"+std::to_string(e2.reward)+"$",{100,255,100}); }
+                                }
+                            }
+                            spawnParticles(b.pos,{255,180,50},30 + b.level*10, 120.f + b.level*30.f);
+                        } else {
+                            if(TOWER_DEFS[int(TowerKind::FROST)].slows && b.color.b>200){
+                                float slowMult = 0.65f - (b.level-1)*0.18f; e.speed = std::max(10.f, e.speed * slowMult); 
+                                if(b.stun && e.kind != EnemyKind::BOSS) e.stunTimer = 0.5f;
+                                spawnParticles(b.pos,{160,220,255},5 + b.level*2, 40.f);
+                            }
+                            
+                            if (b.instakill && e.kind != EnemyKind::BOSS && randFloat(0.f, 1.f) <= 0.10f) { e.takeDamage(99999); addFloat(e.pos(), "ZABOJSTWO!", {255, 0, 0}, 1.5f); } 
+                            else { e.takeDamage(b.damage); }
+                            
+                            if(!e.alive){ score+=e.reward; kills++; money+=e.reward; spawnParticles(e.pos(),e.color,16,90.f); addFloat(e.pos(),"+"+std::to_string(e.reward)+"$",{100,255,100}); } 
+                            else spawnParticles(b.pos,b.color,3,40.f);
+                        }
+                        
+                        if (b.pierce > 0) { b.pierce--; if(b.pierce <= 0) b.life = -1.f; } else { b.life = -1.f; break; }
+                    }
+                }
+            }
+            bullets.erase(std::remove_if(bullets.begin(),bullets.end(),[](const Bullet& b){ return b.life<=0.f; }),bullets.end());
+
+            if(toSpawn==0 && enemies.empty()){
+                wave++;
+                if(wave>=TOTAL_WAVES) phase=Phase::WIN;
+                else { phase=Phase::BUILD; money+=100; addFloat({WIN_W/2.f,WIN_H/2.f-60},"Fala ukonczona! +100$",{100,255,100},2.f); }
+            }
+            if(lives<=0){ lives=0; phase=Phase::GAME_OVER; }
+        }
+
+        updateParticles(dt);
+        for(auto& f:floatTexts){ f.pos.y-=30.f*dt; f.life-=dt; }
+        floatTexts.erase(std::remove_if(floatTexts.begin(),floatTexts.end(),[](const FloatText& f){return f.life<=0;}),floatTexts.end());
+    }
+};
+
+void drawDamageVignette(sf::RenderWindow& w, float timer) {
+    if (timer <= 0.f) return;
+    float alpha = std::min(timer, 1.f) * 130.f; 
+    sf::VertexArray vignette(sf::PrimitiveType::TriangleFan, 6);
+    sf::Color edgeCol(255, 0, 0, static_cast<std::uint8_t>(alpha));
+    sf::Color centerCol(255, 0, 0, 0); 
+    vignette[0].position = {WIN_W/2.f, WIN_H/2.f}; vignette[0].color = centerCol;
+    vignette[1].position = {0, 0};                 vignette[1].color = edgeCol;
+    vignette[2].position = {WIN_W, 0};             vignette[2].color = edgeCol;
+    vignette[3].position = {WIN_W, WIN_H};         vignette[3].color = edgeCol;
+    vignette[4].position = {0, WIN_H};             vignette[4].color = edgeCol;
+    vignette[5].position = {0, 0};                 vignette[5].color = edgeCol;
+    w.draw(vignette);
+}
+
+void drawPath(sf::RenderWindow& w){
+    for(size_t i=1;i<PATH_WP.size();i++){
+        sf::Vector2f a=PATH_WP[i-1], b=PATH_WP[i];
+        sf::Vector2f dir = normalize(b-a), perp = {-dir.y, dir.x};
+        sf::VertexArray quad(sf::PrimitiveType::TriangleStrip, 4);
+        quad[0].position = a+perp*28.f; quad[0].color = {100,80,50};
+        quad[1].position = a-perp*28.f; quad[1].color = {90,70,45};
+        quad[2].position = b+perp*28.f; quad[2].color = {100,80,50};
+        quad[3].position = b-perp*28.f; quad[3].color = {90,70,45};
+        w.draw(quad);
+    }
+    for(size_t i=1;i<PATH_WP.size();i++){
+        sf::Vector2f a=PATH_WP[i-1], b=PATH_WP[i];
+        float segLen = dist(a,b); int dashes = int(segLen/20.f);
+        for(int d=0;d<dashes;d++){
+            sf::VertexArray line(sf::PrimitiveType::Lines, 2);
+            line[0].position = lerp(a,b,d/float(dashes)); line[0].color = {200,180,120,80};
+            line[1].position = lerp(a,b,(d+0.5f)/float(dashes)); line[1].color = {200,180,120,80};
+            w.draw(line);
+        }
+    }
+}
+
+void drawLasers(sf::RenderWindow& w, const Game& g){
+    for(auto& tower : g.towers){
+        if(!tower.firing || tower.kind != TowerKind::LASER) continue;
+        Enemy* target = nullptr;
+        for(auto& e : g.enemies){ if(e.id == tower.targetId){ target = const_cast<Enemy*>(&e); break; } }
+        if(!target) continue;
+        
+        sf::Vector2f dir = normalize(target->pos() - tower.pos);
+        sf::Vector2f perp = {-dir.y, dir.x};
+
+        for(int l = 0; l < tower.level; l++) {
+            float offset = (l - (tower.level-1)/2.f) * 2.5f;
+            sf::Vector2f tP = tower.pos + perp*offset;
+            sf::Vector2f eP = target->pos() + perp*offset;
+
+            sf::VertexArray line(sf::PrimitiveType::Lines, 2);
+            line[0].position = tP;   
+            line[0].color = (tower.mutation == Mutation::PATH_A) ? sf::Color(255,50,50,200) : sf::Color(255,100,255,200);
+            line[1].position = eP;   
+            line[1].color = (tower.mutation == Mutation::PATH_A) ? sf::Color(255,50,50,140) : sf::Color(255,100,255,140);
+            w.draw(line);
+        }
+        
+        for(int i=0;i<3 + tower.level*2;i++){ 
+            sf::VertexArray glow(sf::PrimitiveType::Lines, 2);
+            glow[0].position = tower.pos;      
+            glow[0].color = (tower.mutation == Mutation::PATH_A) ? sf::Color(255,50,50,static_cast<std::uint8_t>(80-i*(15/tower.level))) : sf::Color(255,100,255,static_cast<std::uint8_t>(80-i*(15/tower.level)));
+            glow[1].position = target->pos();  
+            glow[1].color = (tower.mutation == Mutation::PATH_A) ? sf::Color(255,50,50,10) : sf::Color(255,100,255,10);
+            w.draw(glow);
+        }
+    }
+}
+
+constexpr float PANEL_X = 1360.f; constexpr float PANEL_W = WIN_W - PANEL_X;
+
+void drawMenu(sf::RenderWindow& w) {
+    w.draw(makeRect({0,0},{float(WIN_W),float(WIN_H)},{20,20,30}));
+    drawText(w, "TOWER DEFENSE", {WIN_W/2.f, 150}, 60, {150,180,255}, true);
+    drawText(w, "Wybierz poziom trudnosci", {WIN_W/2.f, 230}, 24, {200,200,200}, true);
+    
+    w.draw(makeRect({WIN_W/2.f - 200, 320}, {400, 90}, {40,80,40}, 3.f, {100,255,100}));
+    drawText(w, "LATWY", {WIN_W/2.f, 350}, 28, {255,255,255}, true);
+    drawText(w, "800$, 30 zyc, Slabi wrogowie", {WIN_W/2.f, 385}, 16, {200,255,200}, true);
+    
+    w.draw(makeRect({WIN_W/2.f - 200, 450}, {400, 90}, {80,80,40}, 3.f, {255,255,100}));
+    drawText(w, "NORMALNY", {WIN_W/2.f, 480}, 28, {255,255,255}, true);
+    drawText(w, "600$, 20 zyc, Standardowi wrogowie", {WIN_W/2.f, 515}, 16, {255,255,200}, true);
+    
+    w.draw(makeRect({WIN_W/2.f - 200, 580}, {400, 90}, {80,40,40}, 3.f, {255,100,100}));
+    drawText(w, "TRUDNY", {WIN_W/2.f, 610}, 28, {255,255,255}, true);
+    drawText(w, "400$, 10 zyc, Bardzo silni wrogowie", {WIN_W/2.f, 645}, 16, {255,200,200}, true);
+}
+
+void drawPanel(sf::RenderWindow& w, const Game& g){
+    w.draw(makeRect({PANEL_X, 80}, {PANEL_W, float(WIN_H)-80}, {15,15,30,240}, 2.f, {60,60,100}));
+    drawText(w,"SKLEP",{PANEL_X+PANEL_W/2,90},20,{200,200,255},true);
+    for(int i=0;i<8;i++){
+        float y = 110.f + i*82.f; 
+        bool sel = (int(g.selectedKind)==i);
+        w.draw(makeRect({PANEL_X+10, y},{PANEL_W-20,74}, sel?sf::Color(40,40,80):sf::Color(20,20,40), sel?2.f:1.f, sel?sf::Color(120,120,255):sf::Color(50,50,80)));
+        sf::CircleShape ic(12); ic.setOrigin({12,12}); ic.setPosition({PANEL_X+30, y+20});
+        ic.setFillColor(TOWER_DEFS[i].color); ic.setOutlineColor({255,255,255,100}); ic.setOutlineThickness(2); w.draw(ic);
+        drawText(w, TOWER_DEFS[i].name, {PANEL_X+55, y+2}, 16, {220,220,255});
+        drawText(w, std::to_string(TOWER_DEFS[i].cost)+"$", {PANEL_X+55, y+20}, 14, g.money>=TOWER_DEFS[i].cost?sf::Color(100,255,100):sf::Color(200,80,80));
+        drawText(w,"["+std::to_string(i+1)+"]",{PANEL_X+PANEL_W-30,y+5},12,{120,120,160});
+        
+        if (i != 5 && i != 7) { 
+            w.draw(makeRect({PANEL_X+55,y+42},{(PANEL_W-75)*(TOWER_DEFS[i].range/400.f),5},{80,160,255}));
+            w.draw(makeRect({PANEL_X+55,y+52},{(PANEL_W-75)*(TOWER_DEFS[i].damage/150.f),5},{255,100,100}));
+            drawText(w,"ZAS",{PANEL_X+55,y+41},8,{80,160,255}); drawText(w,"DMG",{PANEL_X+55,y+51},8,{255,100,100});
+        } else {
+            drawText(w, TOWER_DEFS[i].desc, {PANEL_X+55, y+45}, 11, {150,150,200});
+        }
+    }
+    
+    float sy = WIN_H - 120.f;
+    w.draw(makeRect({PANEL_X+10, sy}, {PANEL_W-20, 110}, {40,20,20}, 2.f, {150,50,50}));
+    drawText(w,"ZAKLECIA GRACZA", {PANEL_X+PANEL_W/2, sy+5}, 14, {255,150,150}, true);
+    
+    w.draw(makeRect({PANEL_X+20, sy+20}, {85, 80}, {60,30,30}, 2.f, g.spellMeteorCD<=0?sf::Color(255,100,50):sf::Color(80,50,50)));
+    drawText(w,"[Q]", {PANEL_X+62, sy+25}, 16, {255,255,255}, true);
+    drawText(w,"Meteoryt", {PANEL_X+62, sy+45}, 11, {255,200,150}, true);
+    if(g.spellMeteorCD>0) drawText(w,std::to_string(int(g.spellMeteorCD))+"s", {PANEL_X+62, sy+75}, 18, {255,100,100}, true);
+    else if(g.targetingMeteor) drawText(w,"CELUJE!", {PANEL_X+62, sy+75}, 14, {255,255,0}, true);
+    
+    w.draw(makeRect({PANEL_X+135, sy+20}, {85, 80}, {30,40,60}, 2.f, g.spellFreezeCD<=0?sf::Color(100,200,255):sf::Color(50,60,80)));
+    drawText(w,"[W]", {PANEL_X+177, sy+25}, 16, {255,255,255}, true);
+    drawText(w,"EMP Lód", {PANEL_X+177, sy+45}, 11, {200,240,255}, true);
+    if(g.spellFreezeCD>0) drawText(w,std::to_string(int(g.spellFreezeCD))+"s", {PANEL_X+177, sy+75}, 18, {100,200,255}, true);
+    else drawText(w,"GOTOWE", {PANEL_X+177, sy+75}, 14, {100,255,100}, true);
+}
+
+void drawTopBar(sf::RenderWindow& w, const Game& g){
+    w.draw(makeRect({0,0},{float(WIN_W),78},{10,10,25})); w.draw(makeRect({0,76},{float(WIN_W),2},{60,60,120}));
+    drawText(w,"TOWER DEFENSE",{20,12},28,{150,180,255});
+    for(int i=0;i<g.lives;i++){
+        sf::CircleShape h(7); h.setOrigin({7,7}); h.setPosition({float(400+i*18),24});
+        h.setFillColor(i<g.lives?sf::Color(220,60,60):sf::Color(60,20,20)); w.draw(h);
+    }
+    drawText(w,"ZYCIA",{400,10},13,{200,100,100});
+    drawText(w,"$  "+std::to_string(g.money),{700,14},26,{100,240,100});
+    drawText(w,"☠ "+std::to_string(g.kills),{900,14},26,{220,100,100});
+    drawText(w,"WYNIK: "+std::to_string(g.score),{1060,14},20,{255,220,80});
+    std::string waveStr = (g.phase == Phase::BUILD ? std::string("FAZA BUDOWY - ") : std::string(""))
+                      + "FALA " + std::to_string(g.wave+1) + "/" + std::to_string(TOTAL_WAVES);
+    drawText(w, waveStr, {PANEL_X+PANEL_W/2,14},18,g.phase==Phase::BUILD?sf::Color(100,200,255):sf::Color(255,160,80),true);
+}
+
+void drawMutationOverlay(sf::RenderWindow& w, const Game& g) {
+    w.draw(makeRect({0,0},{float(WIN_W),float(WIN_H)},{0,0,0,200}));
+    drawText(w, "WYBIERZ SCIEZKE MUTACJI!", {WIN_W/2.f, 150}, 46, {255,220,80}, true);
+    drawText(w, "Osiagnieto Poziom 3. Wybierz unikalne ulepszenie dla tej wiezy:", {WIN_W/2.f, 220}, 24, {200,200,255}, true);
+
+    auto it = std::find_if(g.towers.begin(), g.towers.end(), [&](const Tower& t){return t.id == g.mutTargetTowerId;});
+    if(it != g.towers.end()) {
+        auto info = getMutationInfo(it->kind);
+        w.draw(makeRect({WIN_W/2.f - 400, 350}, {350, 300}, {40,40,60}, 4.f, {255,100,100}));
+        drawText(w, info.first, {WIN_W/2.f - 225, 450}, 26, {255,255,255}, true);
+        w.draw(makeRect({WIN_W/2.f + 50, 350}, {350, 300}, {40,40,60}, 4.f, {100,255,100}));
+        drawText(w, info.second, {WIN_W/2.f + 225, 450}, 26, {255,255,255}, true);
+    }
+}
+
+void drawOverlay(sf::RenderWindow& w, const Game& g){
+    w.draw(makeRect({0,0},{float(WIN_W),float(WIN_H)},{0,0,0,160}));
+    drawText(w,g.phase==Phase::WIN?"ZWYCIESTWO!":"KONIEC GRY",{WIN_W/2.f, WIN_H/2.f-60},60,g.phase==Phase::WIN?sf::Color(100,255,100):sf::Color(255,60,60),true);
+    drawText(w,"Wynik: "+std::to_string(g.score),{WIN_W/2.f, WIN_H/2.f+20},30,{255,220,80},true);
+    drawText(w,"Zabici: "+std::to_string(g.kills),{WIN_W/2.f, WIN_H/2.f+65},24,{200,200,255},true);
+    drawText(w,"[R] Powrot do Menu",{WIN_W/2.f, WIN_H/2.f+120},22,{150,255,150},true);
+}
+
+int main(){
+    sf::RenderWindow window(sf::VideoMode({WIN_W,WIN_H}), "Tower Defense — BARRACKS UPDATE", sf::Style::Titlebar|sf::Style::Close);
+    window.setFramerateLimit(60); sf::Clock clock; Game game; bool spaceHeld = false; 
+
+    while(window.isOpen()){
+        sf::Event ev;
+        while(window.pollEvent(ev)){
+            if(ev.type == sf::Event::Closed) window.close();
+
+            if(ev.type == sf::Event::KeyPressed){
+                if(ev.key.code == sf::Keyboard::Space) spaceHeld = true;
+
+                if(ev.key.code == sf::Keyboard::Num1) game.selectedKind=TowerKind::BASIC;
+                if(ev.key.code == sf::Keyboard::Num2) game.selectedKind=TowerKind::SNIPER;
+                if(ev.key.code == sf::Keyboard::Num3) game.selectedKind=TowerKind::ARTILLERY;
+                if(ev.key.code == sf::Keyboard::Num4) game.selectedKind=TowerKind::FROST;
+                if(ev.key.code == sf::Keyboard::Num5) game.selectedKind=TowerKind::LASER;
+                if(ev.key.code == sf::Keyboard::Num6) game.selectedKind=TowerKind::MINE;
+                if(ev.key.code == sf::Keyboard::Num7) game.selectedKind=TowerKind::TESLA;
+                if(ev.key.code == sf::Keyboard::Num8) game.selectedKind=TowerKind::BARRACKS;
+                if(ev.key.code == sf::Keyboard::Enter && game.phase==Phase::BUILD) game.startWave();
+
+                if(ev.key.code == sf::Keyboard::Q && game.spellMeteorCD <= 0.f && game.phase != Phase::MENU) {
+                    game.targetingMeteor = !game.targetingMeteor;
+                }
+                if(ev.key.code == sf::Keyboard::W && game.spellFreezeCD <= 0.f && game.phase != Phase::MENU) {
+                    game.castGlobalFreeze();
+                }
+
+                if(ev.key.code == sf::Keyboard::Delete){
+                    auto it = std::find_if(game.towers.begin(),game.towers.end(),[](const Tower& t){return t.selected;});
+                    if(it!=game.towers.end()){
+                        int refund = it->def().cost/2; game.money += refund;
+                        addFloat(it->pos,"Sprzedano +"+std::to_string(refund)+"$",{100,255,180});
+                        spawnParticles(it->pos,{100,255,100},8,50.f); game.towers.erase(it);
+                    }
+                }
+                if(ev.key.code == sf::Keyboard::R && (game.phase==Phase::GAME_OVER||game.phase==Phase::WIN)) game = Game{}; 
+            }
+
+            if(ev.type == sf::Event::KeyReleased){
+                if(ev.key.code == sf::Keyboard::Space) spaceHeld = false;
+            }
+
+            if(ev.type == sf::Event::MouseButtonPressed){
+                sf::Vector2f mp(float(ev.mouseButton.x), float(ev.mouseButton.y));
+                game.mouseWorld = mp;
+                
+                if (game.phase == Phase::MENU && ev.mouseButton.button == sf::Mouse::Left) {
+                    if(mp.x >= WIN_W/2.f - 200 && mp.x <= WIN_W/2.f + 200) {
+                        if(mp.y >= 320 && mp.y <= 410) game.startGame(Difficulty::EASY);
+                        if(mp.y >= 450 && mp.y <= 540) game.startGame(Difficulty::NORMAL);
+                        if(mp.y >= 580 && mp.y <= 670) game.startGame(Difficulty::HARD);
+                    }
+                    continue; 
+                }
+
+                if (game.phase == Phase::MUTATION_SELECT && ev.mouseButton.button == sf::Mouse::Left) {
+                    if (mp.x >= WIN_W/2.f - 400 && mp.x <= WIN_W/2.f - 50 && mp.y >= 350 && mp.y <= 650) game.applyMutation(Mutation::PATH_A);
+                    else if (mp.x >= WIN_W/2.f + 50 && mp.x <= WIN_W/2.f + 400 && mp.y >= 350 && mp.y <= 650) game.applyMutation(Mutation::PATH_B);
+                    continue;
+                }
+
+                if(ev.mouseButton.button == sf::Mouse::Left && game.phase != Phase::MUTATION_SELECT && game.phase != Phase::MENU){
+                    if(game.targetingMeteor && mp.x < PANEL_X) {
+                        game.castMeteor(mp);
+                        continue;
+                    }
+
+                    bool hit=false;
+                    auto hitIt = std::find_if(game.towers.begin(), game.towers.end(), [&](const Tower& t){ return dist(t.pos, mp) < 22.f; });
+                    if(hitIt != game.towers.end()){
+                        hit = true;
+                        if (hitIt->frozen) {
+                            hitIt->unfreezeClicks--; spawnParticles(hitIt->pos, {255, 255, 255}, 8, 40.f);
+                            if (hitIt->unfreezeClicks <= 0) { hitIt->frozen = false; addFloat(hitIt->pos, "ODBLOKOWANA!", {100, 255, 100}, 1.5f); }
+                            continue; 
+                        }
+                        game.draggedTowerId = hitIt->id; game.dragStartPos = hitIt->pos; hitIt->selected = true;
+                        Tower t = *hitIt; game.towers.erase(hitIt); game.towers.push_back(t);
+                    }
+
+                    for(auto& t : game.towers) if(!hit || t.id != game.draggedTowerId) t.selected = false;
+                    if(!hit && game.phase==Phase::BUILD && mp.x<PANEL_X && !game.targetingMeteor) game.placeTower(mp);
+                    if(mp.x>=PANEL_X){
+                        for(int i=0;i<8;i++){ if(mp.y>=(110.f+i*82.f) && mp.y<=(110.f+i*82.f+74.f)) game.selectedKind = TowerKind(i); }
+                        
+                        float sy = WIN_H - 120.f;
+                        if(mp.x >= PANEL_X+20 && mp.x <= PANEL_X+105 && mp.y >= sy+20 && mp.y <= sy+100 && game.spellMeteorCD<=0) game.targetingMeteor = !game.targetingMeteor;
+                        if(mp.x >= PANEL_X+135 && mp.x <= PANEL_X+220 && mp.y >= sy+20 && mp.y <= sy+100 && game.spellFreezeCD<=0) game.castGlobalFreeze();
+                    }
+                }
+                if(ev.mouseButton.button == sf::Mouse::Right && game.phase != Phase::MUTATION_SELECT && game.phase != Phase::MENU){
+                    game.targetingMeteor = false; 
+                    for(auto& t:game.towers) t.selected=false;
+                    if(game.draggedTowerId != -1){
+                        auto itD = std::find_if(game.towers.begin(), game.towers.end(), [&](const Tower& t){return t.id == game.draggedTowerId;});
+                        if(itD != game.towers.end()) {
+                            itD->pos = game.dragStartPos;
+                            if (itD->kind == TowerKind::BARRACKS) {
+                                itD->rallyPoint = getClosestPathPoint(itD->pos);
+                                for(int i=0; i<3; i++) {
+                                    float angle = i * 2.094f;
+                                    itD->warriors[i].rallyPoint = itD->rallyPoint + sf::Vector2f(std::cos(angle)*12.f, std::sin(angle)*12.f);
+                                }
+                            }
+                        }
+                        game.draggedTowerId = -1;
+                    }
+                }
+            }
+
+            if(ev.type == sf::Event::MouseButtonReleased){
+                if(ev.mouseButton.button == sf::Mouse::Left && game.draggedTowerId != -1){
+                    auto itD = std::find_if(game.towers.begin(), game.towers.end(), [&](const Tower& t){return t.id == game.draggedTowerId;});
+                    if(itD != game.towers.end()){
+                        bool merged = false;
+                        for(auto& target : game.towers){
+                            if(target.id != itD->id && dist(target.pos, game.mouseWorld) < 30.f){
+                                if(target.frozen) continue;
+                                if(target.kind == itD->kind && target.level == itD->level && target.level < Game::MAX_LEVEL){
+                                    if (target.level == 2) {
+                                        game.prevPhase = game.phase; game.phase = Phase::MUTATION_SELECT;
+                                        game.mutSourceTowerId = itD->id; game.mutTargetTowerId = target.id;
+                                        merged = true; itD->pos = game.dragStartPos; break;
+                                    } else {
+                                        target.level++; addFloat(target.pos, "MERGE! ★", {255,100,255}, 1.5f);
+                                        spawnParticles(target.pos, {255,100,255}, 20, 100.f);
+                                        if(target.kind == TowerKind::BARRACKS) {
+                                            for(auto& w : target.warriors) { w.maxHp = 60 + (target.level-1)*40; w.hp = w.maxHp; }
+                                        }
+                                        merged = true; game.towers.erase(itD); break;
+                                    }
+                                }
+                            }
+                        }
+                        if(!merged) {
+                            itD->pos = game.dragStartPos;
+                        } else if (itD != game.towers.end() && itD->kind == TowerKind::BARRACKS) {
+                            itD->rallyPoint = getClosestPathPoint(itD->pos);
+                            for(int i=0; i<3; i++) {
+                                float angle = i * 2.094f;
+                                itD->warriors[i].rallyPoint = itD->rallyPoint + sf::Vector2f(std::cos(angle)*12.f, std::sin(angle)*12.f);
+                            }
+                        }
+                    }
+                    game.draggedTowerId = -1;
+                }
+            }
+
+            if(ev.type == sf::Event::MouseMoved){
+                game.mouseWorld = sf::Vector2f(float(ev.mouseMove.x), float(ev.mouseMove.y));
+                if(game.draggedTowerId != -1){
+                    for(auto& t : game.towers){
+                        if(t.id == game.draggedTowerId){ 
+                            t.pos = game.mouseWorld; 
+                            if(t.kind == TowerKind::BARRACKS) { 
+                                t.rallyPoint = getClosestPathPoint(t.pos);
+                                for(int i=0; i<3; i++) {
+                                    float angle = i * 2.094f;
+                                    t.warriors[i].rallyPoint = t.rallyPoint + sf::Vector2f(std::cos(angle)*12.f, std::sin(angle)*12.f);
+                                }
+                            }
+                            break; 
+                        }
+                    }
+                }
+            }
+        }
+
+        float dt = std::min(clock.restart().asSeconds(), 0.05f);
+        if (spaceHeld && (game.phase == Phase::COMBAT || game.phase == Phase::BUILD)) dt *= 3.0f; 
+        if(game.phase==Phase::COMBAT || game.phase==Phase::BUILD) game.update(dt);
+
+        window.clear({15,35,15});
+        
+        sf::View defaultView = window.getDefaultView();
+        if (game.screenShake > 0.f && game.phase != Phase::MENU) {
+            float sx = randFloat(-game.screenShake, game.screenShake);
+            float sy = randFloat(-game.screenShake, game.screenShake);
+            defaultView.move({sx, sy});
+        }
+        window.setView(defaultView);
+        
+        if (game.phase == Phase::MENU) { drawMenu(window); } 
+        else {
+            sf::RectangleShape tile({TILE,TILE});
+            for(float x=0;x<PANEL_X;x+=TILE)
+                for(float y=80;y<WIN_H;y+=TILE){
+                    int shade = ((int(x/TILE)+int((y-80)/TILE))%2) ? 28 : 22;
+                    tile.setFillColor({static_cast<std::uint8_t>(shade), static_cast<std::uint8_t>(shade+18), static_cast<std::uint8_t>(shade)});
+                    tile.setPosition({x,y}); window.draw(tile);
+                }
+
+            drawPath(window);
+            for(auto& t:game.towers) {
+                if (game.phase == Phase::MUTATION_SELECT && t.id == game.mutSourceTowerId) continue;
+                t.draw(window, game.phase==Phase::BUILD, t.id == game.draggedTowerId);
+            }
+            drawParticles(window);
+
+            for(auto& b:bullets){
+                sf::CircleShape bc(b.radius); bc.setOrigin({b.radius,b.radius});
+                bc.setPosition(b.pos); bc.setFillColor(b.color); window.draw(bc);
+            }
+
+            for(auto& e:game.enemies) e.draw(window);
+            
+            if (game.targetingMeteor && game.mouseWorld.x < PANEL_X) {
+                sf::CircleShape blast(220.f); blast.setOrigin({220.f, 220.f});
+                blast.setPosition(game.mouseWorld); blast.setFillColor({255,50,0, 40});
+                blast.setOutlineColor({255,50,0, 150}); blast.setOutlineThickness(2.f);
+                window.draw(blast);
+                drawText(window, "KLIKNIJ BY UDERZYC", {game.mouseWorld.x, game.mouseWorld.y - 30.f}, 16, sf::Color::Yellow, true);
+            }
+            
+            drawLasers(window, game);
+
+            if(game.phase==Phase::BUILD && game.mouseWorld.x < PANEL_X && game.draggedTowerId == -1 && !game.targetingMeteor){
+                sf::CircleShape prev(20.f); prev.setOrigin({20,20}); prev.setPosition(game.mouseWorld);
+                bool ok = game.canPlace(game.mouseWorld) && game.canAfford();
+                prev.setFillColor(ok?sf::Color(100,255,100,60):sf::Color(255,80,80,60));
+                prev.setOutlineColor(ok?sf::Color(100,255,100,160):sf::Color(255,80,80,160));
+                prev.setOutlineThickness(2); window.draw(prev);
+
+                float rng = TOWER_DEFS[int(game.selectedKind)].range;
+                if(rng > 0) { 
+                    sf::CircleShape rc(rng); rc.setOrigin({rng,rng}); rc.setPosition(game.mouseWorld);
+                    rc.setFillColor({255,255,255,8}); rc.setOutlineColor(ok?sf::Color(100,255,100,80):sf::Color(255,80,80,80));
+                    rc.setOutlineThickness(1); window.draw(rc);
+                }
+            }
+
+            sf::Font* f = loadFont();
+            if(f){
+                for(auto& ft:floatTexts){
+                    sf::Text t(*f, ft.txt, 16); sf::Color c = ft.col;
+                    c.a = static_cast<std::uint8_t>(255*std::min(ft.life,1.f));
+                    t.setFillColor(c); auto b = t.getLocalBounds();
+                    t.setOrigin({b.position.x+b.size.x/2, b.position.y+b.size.y/2});
+                    t.setPosition(ft.pos); window.draw(t);
+                }
+            }
+
+            window.setView(window.getDefaultView());
+            
+            drawTopBar(window, game); drawPanel(window, game);
+            drawDamageVignette(window, game.damageFlashTimer);
+
+            if (game.phase == Phase::MUTATION_SELECT) drawMutationOverlay(window, game);
+            if (game.phase == Phase::GAME_OVER || game.phase == Phase::WIN) drawOverlay(window, game);
+        } 
+
+        window.display();
+    }
+    return 0;
+}
